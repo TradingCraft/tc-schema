@@ -53,7 +53,7 @@ DEFAULT_PATCH_DIR = os.environ.get(
 DEFAULT_DSN_FALLBACK = "postgresql://localhost:5433/tcdata"
 
 # Patch files must match: NNN_description.sql  (e.g. 001_schema.sql)
-PATCH_PATTERN = re.compile(r"^(\d{3})_.+\.sql$")
+PATCH_PATTERN = re.compile(r"^(\d+)_.+\.sql$")
 
 
 # ── Data types ───────────────────────────────────────────────────────────────
@@ -410,7 +410,7 @@ def cmdExport(dsn: str, output_path: Path, schema_only: bool, data_only: bool):
     mode = "schema-only" if schema_only else "data-only" if data_only else "full"
     print(f"Exporting ({mode}) → {output_path} ...")
     subprocess.run(cmd, check=True)
-    print(f"✓ Export complete.")
+    print("✓ Export complete.")
 
 
 def cmdImport(dsn: str, input_path: Path, schema_only: bool, data_only: bool):
@@ -440,7 +440,7 @@ def cmdImport(dsn: str, input_path: Path, schema_only: bool, data_only: bool):
     mode = "schema-only" if schema_only else "data-only" if data_only else "full"
     print(f"Importing ({mode}) ← {input_path} ...")
     subprocess.run(cmd, check=True, env=env)
-    print(f"✓ Import complete.")
+    print("✓ Import complete.")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

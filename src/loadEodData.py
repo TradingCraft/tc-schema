@@ -5,7 +5,7 @@ loadEodData.py — Load/ingest EOD data.
 No pandas dependency — uses only stdlib csv + psycopg.
 
 Subcommands:
-  prices             Upsert EOD prices from CSV (auto-creates unknown instruments)
+  import-csv         Upsert EOD prices from CSV (auto-creates unknown instruments)
   import-eod         Upsert EOD prices from MetaStock daily format file
   add-instrument     Add or update a single instrument
   list-instruments   Show all registered instruments
@@ -18,8 +18,8 @@ Dependencies:  pip install psycopg[binary]
 Optional:      pip install yfinance   (only needed for 'enrich' subcommand)
 
 Usage:
-    python src/loadEodData.py prices data/2026-04-09.csv
-    python src/loadEodData.py prices data/2026-04-09.csv --no-auto-add
+    python src/loadEodData.py import-csv data/2026-04-09.csv
+    python src/loadEodData.py import-csv data/2026-04-09.csv --no-auto-add
     python src/loadEodData.py import-eod data/20260417_MS-Format.txt
     python src/loadEodData.py enrich
     python src/loadEodData.py enrich --symbol BHP
@@ -310,7 +310,7 @@ DO UPDATE SET
 """
 
 
-def cmdPrices(args):
+def cmdImportCsv(args):
     path = Path(args.csv)
     if not path.exists():
         print(f"File not found: {path}", file=sys.stderr)
@@ -673,7 +673,7 @@ def main():
         epilog="""
 workflow:
   1. Ingest prices (instruments auto-created as stubs):
-       python src/loadEodData.py prices data/2026-04-09.csv
+       python src/loadEodData.py import-csv data/2026-04-09.csv
        python src/loadEodData.py import-eod data/20260417_MS-Format.txt
 
   2. Backfill metadata from Yahoo Finance:
@@ -683,9 +683,9 @@ workflow:
        python src/loadEodData.py add-action BHP split 2.0 --ex-date 2026-06-01
 
 examples:
-  python src/loadEodData.py prices data/2026-04-09.csv
-  python src/loadEodData.py prices data/2026-04-09.csv --no-auto-add
-  python src/loadEodData.py prices data/2026-04-09.csv --exchange NYSE --currency USD
+  python src/loadEodData.py import-csv data/2026-04-09.csv
+  python src/loadEodData.py import-csv data/2026-04-09.csv --no-auto-add
+  python src/loadEodData.py import-csv data/2026-04-09.csv --exchange NYSE --currency USD
   python src/loadEodData.py enrich
   python src/loadEodData.py enrich --symbol BHP
   python src/loadEodData.py list-instruments
@@ -696,8 +696,8 @@ examples:
     parser.add_argument("--dsn", default=DSN, help="PostgreSQL connection string")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # prices
-    p_prices = sub.add_parser("prices", help="Upsert EOD prices from CSV")
+    # import-csv
+    p_prices = sub.add_parser("import-csv", help="Upsert EOD prices from CSV")
     p_prices.add_argument("csv", help="Path to CSV file")
     p_prices.add_argument(
         "--no-auto-add", dest="auto_add", action="store_false", default=True,
@@ -751,7 +751,7 @@ examples:
     args = parser.parse_args()
 
     dispatch = {
-        "prices": cmdPrices,
+        "import-csv": cmdImportCsv,
         "import-eod": cmdImportEod,
         "enrich": cmdEnrich,
         "add-instrument": cmdAddInstrument,

@@ -28,7 +28,10 @@ python src/opSchema.py --drop-db
 python src/opSchema.py --reset-db
 
 # Ingest EOD prices from CSV
-python src/loadEodData.py prices data/2026-04-09.csv
+python src/loadEodData.py import-csv data/2026-04-09.csv
+
+# Ingest EOD prices from MetaStock formatted file
+python src/loadEodData.py import-eod data/20260417_MS-Format.txt
 
 # Backfill instrument metadata from Yahoo Finance
 pip install yfinance
@@ -49,9 +52,9 @@ The missing FK is intentional. Do not add one — it will fail at runtime.
 Referential integrity is enforced at the application layer in `loadEodData.py`.
 
 ### Instrument stub creation and price upsert share one transaction
-In `cmdPrices`, auto-creating instrument stubs and upserting the prices that
+In `cmdImportCsv`, auto-creating instrument stubs and upserting the prices that
 reference them must succeed or fail together. `autoAddInstruments` must not
-commit internally. The caller (`cmdPrices`) owns the single commit after both
+commit internally. The caller (`cmdImportCsv`) owns the single commit after both
 writes succeed.
 
 ### DSN resolution order
