@@ -79,6 +79,54 @@ pg_ctl -D ~/TC/pgdb status
 pg_ctl -D ~/TC/pgdb stop
 ```
 
+### systemd user service (auto-start on login)
+
+Create `~/.config/systemd/user/postgresql-tc.service`:
+
+```ini
+[Unit]
+Description=PostgreSQL (TC user instance)
+After=network.target
+
+[Service]
+Type=forking
+Environment=LD_LIBRARY_PATH=/opt/local/lib
+Environment=PATH=/opt/local/bin:/usr/local/bin:/usr/bin:/bin
+
+Environment=PGDATA=%h/TC/pgdb
+Environment=PGPORT=5433
+
+ExecStart=/opt/local/bin/pg_ctl -D %h/TC/pgdb -l %h/TC/pgdb/server.log start
+ExecStop=/opt/local/bin/pg_ctl -D %h/TC/pgdb stop
+ExecReload=/opt/local/bin/pg_ctl -D %h/TC/pgdb reload
+
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and manage the service:
+
+```bash
+# Reload systemd, enable at login, and start now
+systemctl --user daemon-reload
+systemctl --user enable postgresql-tc.service
+systemctl --user start postgresql-tc.service
+
+# Check status / logs
+systemctl --user status postgresql-tc.service
+journalctl --user -u postgresql-tc.service -f
+
+# Stop / restart
+systemctl --user stop postgresql-tc.service
+systemctl --user restart postgresql-tc.service
+```
+
+> **Note:** `%h` expands to your home directory. `PGPORT=5433` must match
+> the `port` setting in `~/TC/pgdb/postgresql.conf`.
+
 ### Verify connectivity
 
 ```bash
