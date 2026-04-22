@@ -21,6 +21,8 @@ Usage:
     python src/loadEodData.py import-csv data/2026-04-09.csv
     python src/loadEodData.py import-csv data/2026-04-09.csv --no-auto-add
     python src/loadEodData.py import-eod data/20260417_MS-Format.txt
+    python src/loadEodData.py import-eod data/20260417_MS-Format.zip
+    python src/loadEodData.py import-eod data/*.txt
     python src/loadEodData.py enrich
     python src/loadEodData.py enrich --symbol BHP
 """
@@ -29,9 +31,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
+import io
 import os
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -181,53 +186,128 @@ def autoAddInstruments(
     return sym_map
 
 
-def readCsvPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
-    """Read CSV, return (valid_rows, [(line_num, error_msg), ...])."""
+def _sniffFormat(text: str) -> str:
+    """Return 'ec' if text looks like EC format, otherwise 'csv'."""
+    first_line = text.lstrip("\r\n").split("\n")[0]
+    fields = next(csv.reader([first_line]), [])
+    if len(fields) == 7:
+        ds = fields[1].strip()
+        if len(ds) == 6 and ds.isdigit():
+            return "ec"
+    return "csv"
+
+
+def _parseCsvPrices(text: str, name: str = "") -> tuple[list[PriceRow], list[tuple[int, str]]]:
     rows: list[PriceRow] = []
     errors: list[tuple[int, str]] = []
 
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
+    reader = csv.DictReader(io.StringIO(text))
 
-        # Check required columns
-        required = {"symbol", "trade_date", "open", "high", "low", "close", "volume"}
-        if reader.fieldnames is None:
-            print("Empty CSV file.", file=sys.stderr)
-            sys.exit(1)
-        missing = required - set(reader.fieldnames)
-        if missing:
-            print(f"CSV missing columns: {missing}", file=sys.stderr)
-            sys.exit(1)
+    required = {"symbol", "trade_date", "open", "high", "low", "close", "volume"}
+    if reader.fieldnames is None:
+        print(f"'{name}' is empty.", file=sys.stderr)
+        sys.exit(1)
+    missing = required - set(reader.fieldnames)
+    if missing:
+        print(f"'{name}' missing columns: {missing}", file=sys.stderr)
+        sys.exit(1)
 
-        for i, raw in enumerate(reader, start=2):  # line 1 is header
-            try:
-                pr = PriceRow.fromCsv(raw)
-            except (ValueError, InvalidOperation, KeyError) as e:
-                errors.append((i, f"parse error: {e}"))
-                continue
+    for i, raw in enumerate(reader, start=2):  # line 1 is header
+        try:
+            pr = PriceRow.fromCsv(raw)
+        except (ValueError, InvalidOperation, KeyError) as e:
+            errors.append((i, f"parse error: {e}"))
+            continue
 
-            reason = pr.whyInvalid()
-            if reason:
-                errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
-                continue
+        reason = pr.whyInvalid()
+        if reason:
+            errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
+            continue
 
-            rows.append(pr)
+        rows.append(pr)
 
     return rows, errors
 
 
-def _detectMsFormat(path: Path) -> None:
-    """Abort early if the file does not look like MetaStock daily format.
+def _parseEcPrices(text: str, name: str = "") -> tuple[list[PriceRow], list[tuple[int, str]]]:
+    """Parse EC format (no header): SYMBOL,YYMMDD,O_cents,H_cents,L_cents,C_cents,VOL"""
+    rows: list[PriceRow] = []
+    errors: list[tuple[int, str]] = []
+
+    for i, cols in enumerate(csv.reader(io.StringIO(text)), start=1):
+        if not cols:
+            continue
+        if len(cols) != 7:
+            errors.append((i, f"expected 7 fields, got {len(cols)}"))
+            continue
+        try:
+            ds = cols[1].strip()
+            trade_date = date(2000 + int(ds[:2]), int(ds[2:4]), int(ds[4:6]))
+            pr = PriceRow(
+                symbol=cols[0].strip().upper(),
+                trade_date=trade_date,
+                open=Decimal(cols[2].strip()) / 100,
+                high=Decimal(cols[3].strip()) / 100,
+                low=Decimal(cols[4].strip()) / 100,
+                close=Decimal(cols[5].strip()) / 100,
+                volume=int(Decimal(cols[6].strip())),
+            )
+        except (ValueError, InvalidOperation, IndexError) as e:
+            errors.append((i, f"parse error: {e}"))
+            continue
+
+        reason = pr.whyInvalid()
+        if reason:
+            errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
+            continue
+
+        rows.append(pr)
+
+    return rows, errors
+
+
+def _parsePrices(text: str, name: str) -> tuple[list[PriceRow], list[tuple[int, str]]]:
+    """Auto-detect CSV or EC format and parse."""
+    fmt = _sniffFormat(text)
+    if fmt == "ec":
+        print(f"  Detected EC format: {name}")
+        return _parseEcPrices(text, name)
+    return _parseCsvPrices(text, name)
+
+
+def readCsvPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
+    """Read prices from CSV or EC format file. Supports .zip archives."""
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            members = [m for m in zf.namelist() if not m.endswith("/")]
+            if not members:
+                print(f"No files found in {path.name}", file=sys.stderr)
+                sys.exit(1)
+            all_rows: list[PriceRow] = []
+            all_errors: list[tuple[int, str]] = []
+            for member in members:
+                print(f"  Extracting {member}...")
+                text = zf.read(member).decode("utf-8", errors="replace")
+                rows, errors = _parsePrices(text, member)
+                all_rows.extend(rows)
+                all_errors.extend(errors)
+            return all_rows, all_errors
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return _parsePrices(text, path.name)
+
+
+def _detectMsFormat(f: "io.StringIO", name: str) -> None:
+    """Abort early if the stream does not look like MetaStock daily format.
 
     MetaStock daily: 8 columns, date field is YYYYMMDD (8 digits).
     EC format uses 7 columns and YYMMDD (6-digit) dates with prices in cents —
     ingesting it as MetaStock would produce dates from 1926 and prices 100× too high.
     """
-    with open(path, newline="") as f:
-        first = next(csv.reader(f), None)
+    first = next(csv.reader(f), None)
 
     if first is None:
-        print("File is empty.", file=sys.stderr)
+        print(f"'{name}' is empty.", file=sys.stderr)
         sys.exit(1)
 
     ncols = len(first)
@@ -235,7 +315,7 @@ def _detectMsFormat(path: Path) -> None:
 
     if ncols == 7 and len(ds) == 6:
         print(
-            f"ERROR: '{path.name}' looks like EC format "
+            f"ERROR: '{name}' looks like EC format "
             f"(7 columns, 6-digit date '{ds}').\n"
             "MetaStock format requires 8 columns and YYYYMMDD dates.\n"
             "Prices in EC files are in cents — ingesting them as MetaStock\n"
@@ -246,55 +326,81 @@ def _detectMsFormat(path: Path) -> None:
 
     if ncols != 8:
         print(
-            f"ERROR: expected 8 columns (MetaStock daily), got {ncols} in '{path.name}'.",
+            f"ERROR: expected 8 columns (MetaStock daily), got {ncols} in '{name}'.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     if len(ds) != 8 or not ds.isdigit():
         print(
-            f"ERROR: expected 8-digit YYYYMMDD date in column 2, got '{ds}' in '{path.name}'.",
+            f"ERROR: expected 8-digit YYYYMMDD date in column 2, got '{ds}' in '{name}'.",
             file=sys.stderr,
         )
         sys.exit(1)
 
 
-def readMsPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
-    """Read MetaStock daily format (no header): SYMBOL,YYYYMMDD,O,H,L,C,VOL,OI"""
-    _detectMsFormat(path)
+def _parseMsPrices(text: str, name: str) -> tuple[list[PriceRow], list[tuple[int, str]]]:
+    """Parse MetaStock daily text content. name is used only for error messages."""
+    f = io.StringIO(text)
+    _detectMsFormat(f, name)
+    f.seek(0)
 
     rows: list[PriceRow] = []
     errors: list[tuple[int, str]] = []
 
-    with open(path, newline="") as f:
-        for i, cols in enumerate(csv.reader(f), start=1):
-            if len(cols) != 8:
-                errors.append((i, f"expected 8 fields, got {len(cols)}"))
-                continue
-            try:
-                ds = cols[1].strip()
-                trade_date = date(int(ds[:4]), int(ds[4:6]), int(ds[6:8]))
-                pr = PriceRow(
-                    symbol=cols[0].strip().upper(),
-                    trade_date=trade_date,
-                    open=Decimal(cols[2].strip()),
-                    high=Decimal(cols[3].strip()),
-                    low=Decimal(cols[4].strip()),
-                    close=Decimal(cols[5].strip()),
-                    volume=int(Decimal(cols[6].strip())),
-                )
-            except (ValueError, InvalidOperation, IndexError) as e:
-                errors.append((i, f"parse error: {e}"))
-                continue
+    for i, cols in enumerate(csv.reader(f), start=1):
+        if len(cols) != 8:
+            errors.append((i, f"expected 8 fields, got {len(cols)}"))
+            continue
+        try:
+            ds = cols[1].strip()
+            trade_date = date(int(ds[:4]), int(ds[4:6]), int(ds[6:8]))
+            pr = PriceRow(
+                symbol=cols[0].strip().upper(),
+                trade_date=trade_date,
+                open=Decimal(cols[2].strip()),
+                high=Decimal(cols[3].strip()),
+                low=Decimal(cols[4].strip()),
+                close=Decimal(cols[5].strip()),
+                volume=int(Decimal(cols[6].strip())),
+            )
+        except (ValueError, InvalidOperation, IndexError) as e:
+            errors.append((i, f"parse error: {e}"))
+            continue
 
-            reason = pr.whyInvalid()
-            if reason:
-                errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
-                continue
+        reason = pr.whyInvalid()
+        if reason:
+            errors.append((i, f"OHLC sanity failed: {pr.symbol} {pr.trade_date} ({reason})"))
+            continue
 
-            rows.append(pr)
+        rows.append(pr)
 
     return rows, errors
+
+
+def readMsPrices(path: Path) -> tuple[list[PriceRow], list[tuple[int, str]]]:
+    """Read MetaStock daily format (no header): SYMBOL,YYYYMMDD,O,H,L,C,VOL,OI
+
+    Supports plain text files and .zip archives (all members processed).
+    """
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            members = [m for m in zf.namelist() if not m.endswith("/")]
+            if not members:
+                print(f"No files found in {path.name}", file=sys.stderr)
+                sys.exit(1)
+            all_rows: list[PriceRow] = []
+            all_errors: list[tuple[int, str]] = []
+            for member in members:
+                print(f"  Extracting {member}...")
+                text = zf.read(member).decode("utf-8", errors="replace")
+                rows, errors = _parseMsPrices(text, member)
+                all_rows.extend(rows)
+                all_errors.extend(errors)
+            return all_rows, all_errors
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return _parseMsPrices(text, path.name)
 
 
 # ── Price ingestion ──────────────────────────────────────────────────────────
@@ -311,25 +417,41 @@ DO UPDATE SET
 
 
 def cmdImportCsv(args):
-    path = Path(args.csv)
-    if not path.exists():
-        print(f"File not found: {path}", file=sys.stderr)
-        sys.exit(1)
+    paths: list[Path] = []
+    for pat in args.files:
+        p = Path(pat)
+        if p.exists():
+            paths.append(p)
+        else:
+            matched = sorted(Path(m) for m in glob.glob(pat))
+            if not matched:
+                print(f"No files match: {pat}", file=sys.stderr)
+                sys.exit(1)
+            paths.extend(matched)
 
-    rows, errors = readCsvPrices(path)
+    all_rows: list[PriceRow] = []
+    all_errors: list[tuple[int, str]] = []
 
-    if errors:
-        print(f"⚠  {len(errors)} rows skipped:", file=sys.stderr)
-        for line_num, msg in errors[:10]:
+    for path in paths:
+        if len(paths) > 1:
+            print(f"Reading {path}...")
+        rows, errors = readCsvPrices(path)
+        all_rows.extend(rows)
+        all_errors.extend(errors)
+
+    if all_errors:
+        limit = len(all_errors) if args.verbose else 10
+        print(f"⚠  {len(all_errors)} rows skipped:", file=sys.stderr)
+        for line_num, msg in all_errors[:limit]:
             print(f"   line {line_num}: {msg}", file=sys.stderr)
-        if len(errors) > 10:
-            print(f"   ... and {len(errors) - 10} more", file=sys.stderr)
+        if len(all_errors) > limit:
+            print(f"   ... and {len(all_errors) - limit} more", file=sys.stderr)
 
-    if not rows:
+    if not all_rows:
         print("No valid rows to ingest.", file=sys.stderr)
         sys.exit(1)
 
-    all_symbols = {r.symbol for r in rows}
+    all_symbols = {r.symbol for r in all_rows}
 
     with psycopg.connect(args.dsn) as conn:
         # Keep the whole ingest in a single transaction.
@@ -351,9 +473,9 @@ def cmdImportCsv(args):
             unknown = all_symbols - set(sym_map)
             if unknown:
                 print(f"⚠  Unknown symbols (skipped): {sorted(unknown)}", file=sys.stderr)
-                rows = [r for r in rows if r.symbol in sym_map]
+                all_rows = [r for r in all_rows if r.symbol in sym_map]
 
-        if not rows:
+        if not all_rows:
             print("Nothing to ingest.", file=sys.stderr)
             sys.exit(1)
 
@@ -367,37 +489,56 @@ def cmdImportCsv(args):
                 "close": r.close,
                 "volume": r.volume,
             }
-            for r in rows
+            for r in all_rows
         ]
 
         with conn.cursor() as cur:
             cur.executemany(UPSERT_SQL, params)
         conn.commit()
 
-        dates = {r.trade_date for r in rows}
-        print(f"✓ Upserted {len(rows)} rows across {len(dates)} date(s)")
+        dates = {r.trade_date for r in all_rows}
+        skipped = f"  {len(all_errors)} rows skipped." if all_errors else ""
+        print(f"✓ Upserted {len(all_rows)} rows across {len(dates)} date(s).{skipped}")
 
 
 def cmdImportEod(args):
-    path = Path(args.file)
-    if not path.exists():
-        print(f"File not found: {path}", file=sys.stderr)
-        sys.exit(1)
+    # Resolve each argument: if it exists as a literal path use it directly;
+    # otherwise treat it as a glob pattern (handles quoted globs on any shell).
+    paths: list[Path] = []
+    for pat in args.files:
+        p = Path(pat)
+        if p.exists():
+            paths.append(p)
+        else:
+            matched = sorted(Path(m) for m in glob.glob(pat))
+            if not matched:
+                print(f"No files match: {pat}", file=sys.stderr)
+                sys.exit(1)
+            paths.extend(matched)
 
-    rows, errors = readMsPrices(path)
+    all_rows: list[PriceRow] = []
+    all_errors: list[tuple[int, str]] = []
 
-    if errors:
-        print(f"⚠  {len(errors)} rows skipped:", file=sys.stderr)
-        for line_num, msg in errors[:10]:
+    for path in paths:
+        if len(paths) > 1:
+            print(f"Reading {path}...")
+        rows, errors = readMsPrices(path)
+        all_rows.extend(rows)
+        all_errors.extend(errors)
+
+    if all_errors:
+        limit = len(all_errors) if args.verbose else 10
+        print(f"⚠  {len(all_errors)} rows skipped:", file=sys.stderr)
+        for line_num, msg in all_errors[:limit]:
             print(f"   line {line_num}: {msg}", file=sys.stderr)
-        if len(errors) > 10:
-            print(f"   ... and {len(errors) - 10} more", file=sys.stderr)
+        if len(all_errors) > limit:
+            print(f"   ... and {len(all_errors) - limit} more", file=sys.stderr)
 
-    if not rows:
+    if not all_rows:
         print("No valid rows to ingest.", file=sys.stderr)
         sys.exit(1)
 
-    all_symbols = {r.symbol for r in rows}
+    all_symbols = {r.symbol for r in all_rows}
 
     with psycopg.connect(args.dsn) as conn:
         if args.auto_add:
@@ -407,9 +548,9 @@ def cmdImportEod(args):
             unknown = all_symbols - set(sym_map)
             if unknown:
                 print(f"⚠  Unknown symbols (skipped): {sorted(unknown)}", file=sys.stderr)
-                rows = [r for r in rows if r.symbol in sym_map]
+                all_rows = [r for r in all_rows if r.symbol in sym_map]
 
-        if not rows:
+        if not all_rows:
             print("Nothing to ingest.", file=sys.stderr)
             sys.exit(1)
 
@@ -423,15 +564,16 @@ def cmdImportEod(args):
                 "close": r.close,
                 "volume": r.volume,
             }
-            for r in rows
+            for r in all_rows
         ]
 
         with conn.cursor() as cur:
             cur.executemany(UPSERT_SQL, params)
         conn.commit()
 
-        dates = {r.trade_date for r in rows}
-        print(f"✓ Upserted {len(rows)} rows across {len(dates)} date(s)")
+        dates = {r.trade_date for r in all_rows}
+        skipped = f"  {len(all_errors)} rows skipped." if all_errors else ""
+        print(f"✓ Upserted {len(all_rows)} rows across {len(dates)} date(s).{skipped}")
 
 
 # ── Enrichment from Yahoo Finance ────────────────────────────────────────────
@@ -697,14 +839,18 @@ examples:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # import-csv
-    p_prices = sub.add_parser("import-csv", help="Upsert EOD prices from CSV")
-    p_prices.add_argument("csv", help="Path to CSV file")
+    p_prices = sub.add_parser("import-csv", help="Upsert EOD prices from CSV file(s)")
+    p_prices.add_argument(
+        "files", nargs="+",
+        help="CSV file(s); .zip archives and shell globs are supported",
+    )
     p_prices.add_argument(
         "--no-auto-add", dest="auto_add", action="store_false", default=True,
         help="Skip unknown symbols instead of auto-creating them",
     )
     p_prices.add_argument("--exchange", default="ASX", help="Default exchange (default: ASX)")
     p_prices.add_argument("--currency", default="AUD", help="Default currency (default: AUD)")
+    p_prices.add_argument("--verbose", "-v", action="store_true", help="More verbose output")
 
     # enrich
     p_enrich = sub.add_parser("enrich", help="Backfill metadata from Yahoo Finance")
@@ -739,14 +885,18 @@ examples:
     p_la.add_argument("symbol")
 
     # import-eod
-    p_ms = sub.add_parser("import-eod", help="Upsert EOD prices from MetaStock format file")
-    p_ms.add_argument("file", help="Path to MetaStock daily file (SYMBOL,YYYYMMDD,O,H,L,C,VOL,OI)")
+    p_ms = sub.add_parser("import-eod", help="Upsert EOD prices from MetaStock format file(s)")
+    p_ms.add_argument(
+        "files", nargs="+",
+        help="MetaStock daily file(s); .zip archives and shell globs are supported",
+    )
     p_ms.add_argument(
         "--no-auto-add", dest="auto_add", action="store_false", default=True,
         help="Skip unknown symbols instead of auto-creating them",
     )
     p_ms.add_argument("--exchange", default="ASX", help="Default exchange (default: ASX)")
     p_ms.add_argument("--currency", default="AUD", help="Default currency (default: AUD)")
+    p_ms.add_argument("--verbose", "-v", action="store_true", help="More verbose output")
 
     args = parser.parse_args()
 
