@@ -1,7 +1,8 @@
 # tc-schema — Claude guidance
 
 PostgreSQL 18 + TimescaleDB schema and ingestion scripts for EOD stock market
-data. See `doc/README.md` for user-facing setup and usage instructions.
+data. All database objects live in the `tc` PostgreSQL schema. See
+`doc/README.md` for user-facing setup and usage instructions.
 
 ## Project structure
 

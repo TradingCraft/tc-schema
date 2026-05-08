@@ -11,14 +11,16 @@
 BEGIN;
 
 -- --------------------------------------------------------------------------
--- 0. Extensions
+-- 0. Schema namespace + extensions
 -- --------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS tc;
+
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- --------------------------------------------------------------------------
 -- 1. Instruments
 -- --------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS instrument (
+CREATE TABLE IF NOT EXISTS tc.instrument (
     instrument_id   SERIAL       PRIMARY KEY,
     symbol          VARCHAR(16)  NOT NULL UNIQUE,
     name            TEXT         NOT NULL,
@@ -37,7 +39,7 @@ CREATE TABLE IF NOT EXISTS instrument (
 -- NOTE: instrument_id carries no FOREIGN KEY constraint. TimescaleDB
 -- hypertables do not support FK constraints on the partitioned table itself.
 -- Referential integrity is enforced at the application layer (loadEodData.py).
-CREATE TABLE IF NOT EXISTS eod_price (
+CREATE TABLE IF NOT EXISTS tc.eod_price (
     trade_date      DATE          NOT NULL,
     instrument_id   INT           NOT NULL,
     open            NUMERIC(12,4) NOT NULL,
@@ -54,17 +56,17 @@ CREATE TABLE IF NOT EXISTS eod_price (
 );
 
 -- Hypertable (idempotent via if_not_exists)
-SELECT create_hypertable('eod_price', 'trade_date',
+SELECT create_hypertable('tc.eod_price', 'trade_date',
     chunk_time_interval => INTERVAL '1 month',
     if_not_exists       => TRUE
 );
 
 -- Indexes: CREATE INDEX IF NOT EXISTS is native PostgreSQL
 CREATE UNIQUE INDEX IF NOT EXISTS idx_eod_pk
-    ON eod_price (instrument_id, trade_date DESC);
+    ON tc.eod_price (instrument_id, trade_date DESC);
 
 CREATE INDEX IF NOT EXISTS idx_eod_date
-    ON eod_price (trade_date DESC);
+    ON tc.eod_price (trade_date DESC);
 
 -- Compression (idempotent — will no-op if already set)
 DO $$
@@ -72,10 +74,11 @@ BEGIN
     -- Only set compression if not already enabled
     IF NOT EXISTS (
         SELECT 1 FROM timescaledb_information.hypertables
-         WHERE hypertable_name = 'eod_price'
+         WHERE hypertable_schema = 'tc'
+           AND hypertable_name = 'eod_price'
            AND compression_enabled
     ) THEN
-        ALTER TABLE eod_price SET (
+        ALTER TABLE tc.eod_price SET (
             timescaledb.compress,
             timescaledb.compress_segmentby  = 'instrument_id',
             timescaledb.compress_orderby    = 'trade_date DESC'
@@ -86,7 +89,7 @@ END $$;
 -- Compression policy (idempotent — catches duplicate policy error)
 DO $$
 BEGIN
-    PERFORM add_compression_policy('eod_price', INTERVAL '6 months');
+    PERFORM add_compression_policy('tc.eod_price', INTERVAL '6 months');
 EXCEPTION
     WHEN duplicate_object THEN NULL;  -- policy already exists
 END $$;
@@ -94,9 +97,9 @@ END $$;
 -- --------------------------------------------------------------------------
 -- 3. Corporate Actions
 -- --------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS corporate_action (
+CREATE TABLE IF NOT EXISTS tc.corporate_action (
     action_id       SERIAL       PRIMARY KEY,
-    instrument_id   INT          NOT NULL REFERENCES instrument(instrument_id),
+    instrument_id   INT          NOT NULL REFERENCES tc.instrument(instrument_id),
     ex_date         DATE         NOT NULL,
     action_type     VARCHAR(16)  NOT NULL
                     CHECK (action_type IN ('split','reverse_split',
@@ -106,21 +109,21 @@ CREATE TABLE IF NOT EXISTS corporate_action (
 );
 
 CREATE INDEX IF NOT EXISTS idx_corpact
-    ON corporate_action (instrument_id, ex_date DESC);
+    ON tc.corporate_action (instrument_id, ex_date DESC);
 
 -- --------------------------------------------------------------------------
 -- 4. Views (CREATE OR REPLACE is inherently idempotent)
 -- --------------------------------------------------------------------------
 
-CREATE OR REPLACE VIEW v_latest_price AS
+CREATE OR REPLACE VIEW tc.v_latest_price AS
 SELECT DISTINCT ON (instrument_id)
     i.symbol, i.name,
     p.trade_date, p.open, p.high, p.low, p.close, p.volume
-FROM eod_price p
-JOIN instrument i USING (instrument_id)
+FROM tc.eod_price p
+JOIN tc.instrument i USING (instrument_id)
 ORDER BY instrument_id, trade_date DESC;
 
-CREATE OR REPLACE VIEW v_adjustment_factor AS
+CREATE OR REPLACE VIEW tc.v_adjustment_factor AS
 SELECT
     ca.instrument_id,
     ca.ex_date,
@@ -132,12 +135,12 @@ SELECT
             THEN (p.close - ca.factor) / p.close
         ELSE 1.0
     END AS day_factor
-FROM corporate_action ca
-LEFT JOIN eod_price p
+FROM tc.corporate_action ca
+LEFT JOIN tc.eod_price p
     ON  p.instrument_id = ca.instrument_id
     AND p.trade_date    = ca.ex_date;
 
-CREATE OR REPLACE VIEW v_cumulative_factor AS
+CREATE OR REPLACE VIEW tc.v_cumulative_factor AS
 -- Each row here represents the adjustment factor that should be applied to
 -- prices strictly before `ex_date`.
 --
@@ -165,10 +168,10 @@ SELECT
             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
         )
     ) AS cumulative_factor
-FROM v_adjustment_factor
+FROM tc.v_adjustment_factor
 WHERE day_factor > 0 AND day_factor != 1.0;
 
-CREATE OR REPLACE VIEW v_adjusted_price AS
+CREATE OR REPLACE VIEW tc.v_adjusted_price AS
 SELECT
     p.trade_date,
     p.instrument_id,
@@ -178,47 +181,47 @@ SELECT
     ROUND(p.high  * COALESCE(cf.cumulative_factor, 1.0), 4) AS adj_high,
     ROUND(p.low   * COALESCE(cf.cumulative_factor, 1.0), 4) AS adj_low,
     COALESCE(cf.cumulative_factor, 1.0) AS factor_applied
-FROM eod_price p
+FROM tc.eod_price p
 LEFT JOIN LATERAL (
     -- Join to the nearest future ex-date, not every future action row.
     --
-    -- This only works if `v_cumulative_factor` is defined so that the earliest
-    -- future action already carries the product of that action and all later
-    -- actions. With that invariant in place, picking the closest future
-    -- ex-date gives the exact factor needed for the historical price row.
+    -- This only works if `tc.v_cumulative_factor` is defined so that the
+    -- earliest future action already carries the product of that action and
+    -- all later actions. With that invariant in place, picking the closest
+    -- future ex-date gives the exact factor needed for the historical price row.
     --
     -- The strict `>` is intentional: an action with ex-date D adjusts prices
     -- before D, not the price on D itself.
     SELECT cumulative_factor
-      FROM v_cumulative_factor c
+      FROM tc.v_cumulative_factor c
      WHERE c.instrument_id = p.instrument_id
        AND c.ex_date > p.trade_date
      ORDER BY c.ex_date ASC
      LIMIT 1
 ) cf ON TRUE;
 
--- NOTE: this view chains through v_adjusted_price → v_cumulative_factor →
--- v_adjustment_factor. On large datasets, consider materialising the
+-- NOTE: this view chains through tc.v_adjusted_price → tc.v_cumulative_factor
+-- → tc.v_adjustment_factor. On large datasets, consider materialising the
 -- intermediate views (e.g. as materialized views or temp tables) for
 -- performance-sensitive queries rather than querying v_daily_return directly.
-CREATE OR REPLACE VIEW v_daily_return AS
+CREATE OR REPLACE VIEW tc.v_daily_return AS
 SELECT
     instrument_id, trade_date, adj_close,
     (adj_close - lag(adj_close) OVER w)
         / NULLIF(lag(adj_close) OVER w, 0) AS return_pct
-FROM v_adjusted_price
+FROM tc.v_adjusted_price
 WINDOW w AS (PARTITION BY instrument_id ORDER BY trade_date);
 
 -- --------------------------------------------------------------------------
 -- 5. Schema version tracking
 -- --------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS schema_version (
+CREATE TABLE IF NOT EXISTS tc.schema_version (
     version     INT          PRIMARY KEY,
     description TEXT         NOT NULL,
     applied_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
-INSERT INTO schema_version (version, description)
+INSERT INTO tc.schema_version (version, description)
 VALUES (1, 'Initial compact EOD schema')
 ON CONFLICT (version) DO NOTHING;
 

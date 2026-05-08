@@ -28,13 +28,20 @@ python src/opSchema.py --create-db
 # 2. Verify
 python src/opSchema.py --check
 
-# 3. Ingest prices (instruments auto-created)
-python src/loadEodData.py prices data/2026-04-09.csv
+# 3. Ingest prices from CSV (instruments auto-created as stubs)
+python src/loadEodData.py import-csv data/2026-04-09.csv
+
+# 3b. Or ingest from MetaStock daily format
+python src/loadEodData.py import-eod data/20260417_MS-Format.txt
 
 # 4. Backfill metadata from Yahoo Finance
 pip install yfinance
 python src/loadEodData.py enrich
 ```
+
+> **Schema note:** all database objects live in the `tc` PostgreSQL schema, not
+> `public`. In psql, use `SET search_path = tc;` or prefix table names with
+> `tc.` (e.g. `SELECT * FROM tc.instrument LIMIT 5;`).
 
 ## Adding patches
 
@@ -50,7 +57,7 @@ Each file must be idempotent (use `IF NOT EXISTS`, `CREATE OR REPLACE`,
 
 Run `python src/opSchema.py` — it skips already-applied versions,
 applies only new ones, and records each successful patch in
-`schema_version`.
+`tc.schema_version`.
 
 ## PostgreSQL operational tasks
 

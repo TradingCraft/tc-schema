@@ -10,6 +10,7 @@ Dependencies:  pip install psycopg[binary]
 Usage:
     python src/opSchema.py
     python src/opSchema.py --dsn "postgresql://user:pw@host:5433/tcdata"
+    python src/opSchema.py --schema signal --patch ../tc-signal/sql/patch
     python src/opSchema.py --patch ./sql/patch
     python src/opSchema.py --check      # verify only, don't apply
     python src/opSchema.py --create-db  # create database if missing
@@ -185,39 +186,42 @@ def dropDatabase(server_dsn: str, dbname: str):
     print(f"✓ Dropped database: {dbname}")
 
 
-def getAppliedVersions(conn: psycopg.Connection) -> set[int]:
+def getAppliedVersions(conn: psycopg.Connection, schema: str = "tc") -> set[int]:
     """Return set of already-applied patch versions."""
     with conn.cursor() as cur:
-        # Check if schema_version table exists
         cur.execute("""
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.tables
-                 WHERE table_schema = 'public' AND table_name = 'schema_version'
+                 WHERE table_schema = %s AND table_name = 'schema_version'
             )
-        """)
+        """, (schema,))
         if not cur.fetchone()[0]:
             return set()
 
         try:
-            cur.execute("SELECT version FROM schema_version")
+            cur.execute(
+                psycopg.sql.SQL("SELECT version FROM {}.schema_version").format(
+                    psycopg.sql.Identifier(schema)
+                )
+            )
             return {row[0] for row in cur.fetchall()}
         except psycopg.errors.UndefinedTable:
             conn.rollback()
             return set()
 
 
-def applyPatch(conn: psycopg.Connection, patch: Patch):
+def applyPatch(conn: psycopg.Connection, patch: Patch, schema: str = "tc"):
     """Execute a single patch file."""
     sql = patch.path.read_text(encoding="utf-8")
     with conn.cursor() as cur:
         cur.execute(sql)
         cur.execute(
-            """
-            INSERT INTO schema_version (version, description)
-            VALUES (%s, %s)
-            ON CONFLICT (version) DO UPDATE
-            SET description = EXCLUDED.description
-            """,
+            psycopg.sql.SQL("""
+                INSERT INTO {}.schema_version (version, description)
+                VALUES (%s, %s)
+                ON CONFLICT (version) DO UPDATE
+                SET description = EXCLUDED.description
+            """).format(psycopg.sql.Identifier(schema)),
             (patch.version, patch.description),
         )
     conn.commit()
@@ -261,8 +265,8 @@ def ensureTimescaledbAvailable(conn: psycopg.Connection):
     sys.exit(1)
 
 
-def verifySchema(conn: psycopg.Connection) -> dict:
-    """Discover and report all schema objects present in the public schema."""
+def verifySchema(conn: psycopg.Connection, schema: str = "tc") -> dict:
+    """Discover and report all schema objects present in the target schema."""
     checks = {}
 
     with conn.cursor(row_factory=dict_row) as cur:
@@ -275,33 +279,33 @@ def verifySchema(conn: psycopg.Connection) -> dict:
         row = cur.fetchone()
         checks["timescaledb_version"] = row["extversion"] if row else "NOT INSTALLED"
 
-        # All tables in public schema (discovered, not hardcoded)
+        # All tables in target schema (discovered, not hardcoded)
         cur.execute("""
             SELECT table_name
               FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+             WHERE table_schema = %s AND table_type = 'BASE TABLE'
              ORDER BY table_name
-        """)
+        """, (schema,))
         for r in cur.fetchall():
             checks[f"table:{r['table_name']}"] = True
 
-        # All views in public schema (discovered, not hardcoded)
+        # All views in target schema (discovered, not hardcoded)
         cur.execute("""
             SELECT table_name
               FROM information_schema.views
-             WHERE table_schema = 'public'
+             WHERE table_schema = %s
              ORDER BY table_name
-        """)
+        """, (schema,))
         for r in cur.fetchall():
             checks[f"view:{r['table_name']}"] = True
 
-        # All indexes in public schema (discovered, not hardcoded)
+        # All indexes in target schema (discovered, not hardcoded)
         cur.execute("""
             SELECT indexname
               FROM pg_indexes
-             WHERE schemaname = 'public'
+             WHERE schemaname = %s
              ORDER BY indexname
-        """)
+        """, (schema,))
         for r in cur.fetchall():
             checks[f"index:{r['indexname']}"] = True
 
@@ -310,9 +314,9 @@ def verifySchema(conn: psycopg.Connection) -> dict:
             cur.execute("""
                 SELECT hypertable_name, compression_enabled
                   FROM timescaledb_information.hypertables
-                 WHERE hypertable_schema = 'public'
+                 WHERE hypertable_schema = %s
                  ORDER BY hypertable_name
-            """)
+            """, (schema,))
             for r in cur.fetchall():
                 checks[f"hypertable:{r['hypertable_name']}"] = True
                 checks[f"compression:{r['hypertable_name']}"] = r["compression_enabled"]
@@ -321,21 +325,28 @@ def verifySchema(conn: psycopg.Connection) -> dict:
         cur.execute("""
             SELECT table_name
               FROM information_schema.tables
-             WHERE table_schema = 'public'
+             WHERE table_schema = %s
                AND table_type = 'BASE TABLE'
                AND table_name <> 'schema_version'
              ORDER BY table_name
-        """)
+        """, (schema,))
         user_tables = [r["table_name"] for r in cur.fetchall()]
         for table in user_tables:
-            cur.execute(psycopg.sql.SQL("SELECT count(*) AS n FROM {}").format(
-                psycopg.sql.Identifier(table)
-            ))
+            cur.execute(
+                psycopg.sql.SQL("SELECT count(*) AS n FROM {}.{}").format(
+                    psycopg.sql.Identifier(schema),
+                    psycopg.sql.Identifier(table),
+                )
+            )
             checks[f"rows:{table}"] = cur.fetchone()["n"]
 
         # Applied patches
         try:
-            cur.execute("SELECT version, description, applied_at FROM schema_version ORDER BY version")
+            cur.execute(
+                psycopg.sql.SQL(
+                    "SELECT version, description, applied_at FROM {}.schema_version ORDER BY version"
+                ).format(psycopg.sql.Identifier(schema))
+            )
             checks["patches"] = cur.fetchall()
         except psycopg.errors.UndefinedTable:
             conn.rollback()
@@ -344,8 +355,8 @@ def verifySchema(conn: psycopg.Connection) -> dict:
     return checks
 
 
-def printVerification(checks: dict):
-    print("\n── Schema verification ──────────────────────────────")
+def printVerification(checks: dict, schema: str = "tc"):
+    print(f"\n── Schema verification ({schema}) ──────────────────────────────")
     print(f"  PostgreSQL:   {checks['pg_version']}")
     print(f"  TimescaleDB:  {checks['timescaledb_version']}")
     print()
@@ -466,6 +477,8 @@ examples:
         """,
     )
     parser.add_argument("--dsn", default=DEFAULT_DSN, help="PostgreSQL connection string")
+    parser.add_argument("--schema", default="tc",
+                        help="PostgreSQL schema namespace for schema_version tracking (default: tc)")
     parser.add_argument("--patch", default=DEFAULT_PATCH_DIR,
                         help="Directory containing NNN_*.sql files")
     parser.add_argument("--create-db", action="store_true",
@@ -531,8 +544,8 @@ examples:
     if args.check:
         try:
             with psycopg.connect(args.dsn) as conn:
-                checks = verifySchema(conn)
-                printVerification(checks)
+                checks = verifySchema(conn, args.schema)
+                printVerification(checks, args.schema)
         except psycopg.OperationalError as e:
             print(f"Cannot connect: {e}", file=sys.stderr)
             sys.exit(1)
@@ -555,7 +568,7 @@ examples:
             # abort inside `CREATE EXTENSION timescaledb`.
             ensureTimescaledbAvailable(conn)
 
-            applied = getAppliedVersions(conn)
+            applied = getAppliedVersions(conn, args.schema)
             pending = [p for p in patches if p.version not in applied]
 
             if not pending:
@@ -564,12 +577,12 @@ examples:
                 print(f"Applying {len(pending)} pending patch(es)...")
                 for p in pending:
                     print(f"  → v{p.version:03d}  {p.description} ({p.filename})")
-                    applyPatch(conn, p)
+                    applyPatch(conn, p, args.schema)
                     print(f"    ✓ applied")
 
             # Verify
-            checks = verifySchema(conn)
-            printVerification(checks)
+            checks = verifySchema(conn, args.schema)
+            printVerification(checks, args.schema)
 
     except psycopg.OperationalError as e:
         print(f"Cannot connect: {e}", file=sys.stderr)

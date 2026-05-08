@@ -79,6 +79,16 @@ def _resolveDsn() -> str:
 
 DSN = _resolveDsn()
 
+
+def _connect(dsn: str, search_path: str = "tc", **kwargs) -> psycopg.Connection:
+    """Open a connection with search_path pinned to the requested schema order.
+
+    Default is 'tc' for tc-schema ingestion scripts. tc-signal scripts that
+    need to see both schemas should pass search_path='signal,tc'.
+    """
+    return psycopg.connect(dsn, options=f"-c search_path={search_path}", **kwargs)
+
+
 YAHOO_TYPE_MAP = {
     "EQUITY": "equity",
     "ETF": "etf",
@@ -453,7 +463,7 @@ def cmdImportCsv(args):
 
     all_symbols = {r.symbol for r in all_rows}
 
-    with psycopg.connect(args.dsn) as conn:
+    with _connect(args.dsn) as conn:
         # Keep the whole ingest in a single transaction.
         #
         # This command may do two writes in sequence:
@@ -540,7 +550,7 @@ def cmdImportEod(args):
 
     all_symbols = {r.symbol for r in all_rows}
 
-    with psycopg.connect(args.dsn) as conn:
+    with _connect(args.dsn) as conn:
         if args.auto_add:
             sym_map = autoAddInstruments(conn, all_symbols, args.exchange, args.currency)
         else:
@@ -607,7 +617,7 @@ def fetchYahooInfo(symbol: str, exchange: str = "ASX") -> dict | None:
 
 
 def cmdEnrich(args):
-    with psycopg.connect(args.dsn, row_factory=dict_row) as conn:
+    with _connect(args.dsn, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             if args.symbol:
                 cur.execute(
@@ -666,7 +676,7 @@ def cmdEnrich(args):
 # ── Instrument management ───────────────────────────────────────────────────
 
 def cmdAddInstrument(args):
-    with psycopg.connect(args.dsn) as conn:
+    with _connect(args.dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO instrument (symbol, name, exchange, instrument_type, currency, sector)
@@ -686,7 +696,7 @@ def cmdAddInstrument(args):
 
 
 def cmdListInstruments(args):
-    with psycopg.connect(args.dsn, row_factory=dict_row) as conn:
+    with _connect(args.dsn, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT instrument_id, symbol, name, instrument_type,
@@ -723,7 +733,7 @@ def cmdImportInstruments(args):
             print("CSV must have at least 'symbol' and 'name' columns.", file=sys.stderr)
             sys.exit(1)
 
-        with psycopg.connect(args.dsn) as conn:
+        with _connect(args.dsn) as conn:
             with conn.cursor() as cur:
                 for row in reader:
                     total += 1
@@ -754,7 +764,7 @@ def cmdAddAction(args):
         print(f"Invalid --ex-date '{args.ex_date}': expected YYYY-MM-DD", file=sys.stderr)
         sys.exit(1)
 
-    with psycopg.connect(args.dsn) as conn:
+    with _connect(args.dsn) as conn:
         sym_map = loadSymbolMap(conn)
         sym = args.symbol.upper()
         if sym not in sym_map:
@@ -775,7 +785,7 @@ def cmdAddAction(args):
 
 
 def cmdListActions(args):
-    with psycopg.connect(args.dsn, row_factory=dict_row) as conn:
+    with _connect(args.dsn, row_factory=dict_row) as conn:
         sym_map = loadSymbolMap(conn)
         sym = args.symbol.upper()
         if sym not in sym_map:
